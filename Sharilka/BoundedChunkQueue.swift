@@ -10,7 +10,7 @@
 import Foundation
 
 /// Default number of chunks the queue can hold before the producer suspends.
-nonisolated let kChunkQueueCapacity = 4
+nonisolated let kChunkQueueCapacity = 8
 
 /// A single chunk of file data flowing through the pipeline.
 struct FileChunk: Sendable {

@@ -334,6 +334,21 @@ final class FileReceiveSession: Sendable {
         guard let handle = FileHandle(forWritingAtPath: path) else {
             return .invalid("Failed to create file handle for: \(path)")
         }
+
+        // Pre-allocate file to expected size — avoids thousands of filesystem
+        // extent allocations and metadata updates during the write phase.
+        let fd = handle.fileDescriptor
+        var fstore = fstore_t(
+            fst_flags: UInt32(F_ALLOCATEALL),
+            fst_posmode: Int32(F_PEOFPOSMODE),
+            fst_offset: 0,
+            fst_length: Int64(fileSize),
+            fst_bytesalloc: 0
+        )
+        if fcntl(fd, F_PREALLOCATE, &fstore) != -1 {
+            ftruncate(fd, Int64(fileSize))
+        }
+
         _fileHandle = handle
 
         onLog("Transfer started (v2\(flagsDesc)): \"\(sanitizedName)\" (\(ByteCountFormatter.string(fromByteCount: Int64(fileSize), countStyle: .file)))", false)
@@ -428,7 +443,7 @@ final class FileReceiveSession: Sendable {
     /// Wraps a single NWConnection.receive call as an async operation.
     nonisolated private func receiveOneChunk() async -> ReceiveResult {
         await withCheckedContinuation { continuation in
-            connection.receive(minimumIncompleteLength: 1, maximumLength: SharilkaProtocol.receiveChunkSize) { content, _, isComplete, error in
+            connection.receive(minimumIncompleteLength: SharilkaProtocol.receiveMinimumLength, maximumLength: SharilkaProtocol.receiveChunkSize) { content, _, isComplete, error in
                 if let data = content, !data.isEmpty {
                     continuation.resume(returning: .data(data))
                 } else if let error {
@@ -436,7 +451,6 @@ final class FileReceiveSession: Sendable {
                 } else if isComplete {
                     continuation.resume(returning: .closed)
                 } else {
-                    // Should not happen with minimumIncompleteLength: 1
                     continuation.resume(returning: .closed)
                 }
             }
@@ -449,6 +463,7 @@ final class FileReceiveSession: Sendable {
     /// Determines the final transfer outcome (success or failure).
     nonisolated private func writerLoop(queue: BoundedChunkQueue, expectedSize: UInt64) async {
         var bytesWritten: UInt64 = 0
+        var lastProgressReport = DispatchTime.now()
 
         while let chunk = await queue.dequeue() {
             if Task.isCancelled { break }
@@ -472,7 +487,14 @@ final class FileReceiveSession: Sendable {
 
             bytesWritten += UInt64(chunk.byteCount)
             lock.withLock { _receivedBytes = bytesWritten }
-            onProgress(bytesWritten)
+
+            // Throttle progress callbacks to ~20/s to reduce @MainActor dispatch overhead
+            let now = DispatchTime.now()
+            let elapsed = Double(now.uptimeNanoseconds - lastProgressReport.uptimeNanoseconds) / 1_000_000_000
+            if elapsed >= 0.05 || bytesWritten >= expectedSize {
+                onProgress(bytesWritten)
+                lastProgressReport = now
+            }
         }
 
         // If externally cancelled, cancel() already handled cleanup

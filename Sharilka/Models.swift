@@ -141,7 +141,8 @@ enum SharilkaProtocol {
     static let defaultPort: UInt16 = 5001
     static let defaultSaveDirectory = "/Users/alex/Exchange_Server_Data"
     static let bonjourServiceType = "_sharilka._tcp"
-    static let receiveChunkSize = 1_048_576 // 1 MB
+    static let receiveChunkSize = 2_097_152 // 2 MB
+    static let receiveMinimumLength = 65_536 // 64 KB — reduces callback count ~44x vs 1
 
     /// UserDefaults key for persisted save folder path.
     static let saveDirectoryKey = "SharilkaSaveDirectory"
