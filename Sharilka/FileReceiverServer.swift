@@ -14,7 +14,7 @@ import Network
 protocol FileReceiverServerDelegate: AnyObject, Sendable {
     func serverDidChangeState(_ state: ServerState)
     func serverDidLog(_ message: String, isError: Bool)
-    func serverDidStartTransfer(fileName: String, fileSize: UInt64)
+    func serverDidStartTransfer(fileName: String, fileSize: UInt64, isBenchmark: Bool)
     func serverDidUpdateProgress(receivedBytes: UInt64)
     func serverDidCompleteTransfer(_ result: SessionResult)
 }
@@ -40,7 +40,7 @@ final class FileReceiverServer: @unchecked Sendable {
     var bonjourServiceName: String { bonjourAdvertiser.serviceName }
 
     init(port: UInt16 = SharilkaProtocol.defaultPort,
-         saveDirectory: String = SharilkaProtocol.saveDirectory) {
+         saveDirectory: String = SharilkaProtocol.defaultSaveDirectory) {
         self.port = port
         self.saveDirectory = saveDirectory
         self.bonjourAdvertiser = BonjourAdvertiser(port: port)
@@ -162,9 +162,9 @@ final class FileReceiverServer: @unchecked Sendable {
             onProgress: { [weak self] receivedBytes in
                 self?.delegate?.serverDidUpdateProgress(receivedBytes: receivedBytes)
             },
-            onHeaderParsed: { [weak self] fileName, fileSize in
+            onHeaderParsed: { [weak self] fileName, fileSize, isBenchmark in
                 // Now we have a valid header — enter .receiving state
-                self?.delegate?.serverDidStartTransfer(fileName: fileName, fileSize: fileSize)
+                self?.delegate?.serverDidStartTransfer(fileName: fileName, fileSize: fileSize, isBenchmark: isBenchmark)
             },
             onComplete: { [weak self] result in
                 self?.handleSessionComplete(result)

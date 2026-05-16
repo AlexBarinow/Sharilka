@@ -50,7 +50,7 @@ final class BonjourAdvertiser: @unchecked Sendable {
 
         // Set TXT record with useful metadata for service discovery
         let txtData: [String: String] = [
-            "protocol": "1",
+            "protocol": "2",
             "app": "Sharilka",
             "platform": "macOS",
             "port": "\(port)"

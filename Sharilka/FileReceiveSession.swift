@@ -3,11 +3,15 @@
 //  Sharilka
 //
 //  Handles a single file transfer session over one NWConnection.
-//  Parses the Sharilka binary protocol header, validates magic/version,
+//  Parses the Sharilka binary protocol v2 header, validates magic/version,
 //  then pipelines file data through a bounded in-memory queue:
 //    - a receiver task reads chunks from the TCP connection
 //    - a writer task dequeues chunks and writes them to disk via FileHandle
 //  This overlaps network I/O and disk I/O for better throughput.
+//
+//  Protocol v2 header: magic(4) + version(1) + flags(1) + filenameLen(8) + fileSize(8) + filename
+//  The benchmark flag (bit 0) causes the received file to be automatically
+//  deleted after a successful transfer.
 //
 
 import Foundation
@@ -21,6 +25,7 @@ struct SessionResult: Sendable {
     let duration: TimeInterval
     let success: Bool
     let error: String?
+    let wasBenchmark: Bool
 }
 
 /// Result type for a single NWConnection.receive call.
@@ -37,7 +42,7 @@ final class FileReceiveSession: Sendable {
     let connection: NWConnection
     private let saveDirectory: String
     private let onProgress: @Sendable (UInt64) -> Void
-    private let onHeaderParsed: @Sendable (String, UInt64) -> Void
+    private let onHeaderParsed: @Sendable (String, UInt64, Bool) -> Void
     private let onComplete: @Sendable (SessionResult) -> Void
     private let onLog: @Sendable (String, Bool) -> Void
 
@@ -53,6 +58,8 @@ final class FileReceiveSession: Sendable {
     private var _headerBuffer: Data = Data()
     private var _headerParsed: Bool = false
     private var _filenameLength: UInt64 = 0
+    private var _protocolVersion: UInt8 = 0
+    private var _transferFlags: TransferFlags = .none
     // Pipeline tasks (set once after header is parsed)
     private var _receiverTask: Task<Void, Never>?
     private var _writerTask: Task<Void, Never>?
@@ -90,7 +97,7 @@ final class FileReceiveSession: Sendable {
     init(connection: NWConnection,
          saveDirectory: String,
          onProgress: @escaping @Sendable (UInt64) -> Void,
-         onHeaderParsed: @escaping @Sendable (String, UInt64) -> Void,
+         onHeaderParsed: @escaping @Sendable (String, UInt64, Bool) -> Void,
          onComplete: @escaping @Sendable (SessionResult) -> Void,
          onLog: @escaping @Sendable (String, Bool) -> Void) {
         self.connection = connection
@@ -151,8 +158,8 @@ final class FileReceiveSession: Sendable {
             }
             cleanupPartialFile()
 
-            let (name, expected, received, start) = lock.withLock {
-                (_fileName, _expectedSize, _receivedBytes, _startTime)
+            let (name, expected, received, start, flags) = lock.withLock {
+                (_fileName, _expectedSize, _receivedBytes, _startTime, _transferFlags)
             }
 
             onComplete(SessionResult(
@@ -161,7 +168,8 @@ final class FileReceiveSession: Sendable {
                 receivedBytes: received,
                 duration: Date().timeIntervalSince(start),
                 success: false,
-                error: reason
+                error: reason,
+                wasBenchmark: flags.isBenchmark
             ))
         }
     }
@@ -176,7 +184,7 @@ final class FileReceiveSession: Sendable {
     }
 
     private func readHeaderData() {
-        // Read up to 64 KB during header phase — enough for the 21-byte fixed header
+        // Read up to 64 KB during header phase — enough for the 22-byte fixed header
         // plus any reasonable filename, with room for overflow into file data.
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] content, _, isComplete, error in
             guard let self, !self.isCancelled else { return }
@@ -230,11 +238,13 @@ final class FileReceiveSession: Sendable {
     }
 
     /// Must be called while holding the lock.
+    /// Only protocol v2 is supported. Any other version is rejected.
     private func tryParseHeader() -> HeaderParseResult {
         let buffer = _headerBuffer
+        let fixedSize = SharilkaProtocol.headerFixedSize // 22
 
-        // Need at least the fixed header: 4 (magic) + 1 (version) + 8 (filenameLen) + 8 (fileSize) = 21 bytes
-        guard buffer.count >= SharilkaProtocol.headerFixedSize else {
+        // Need at least 5 bytes to read magic + version
+        guard buffer.count >= 5 else {
             return .needMoreData
         }
 
@@ -247,14 +257,24 @@ final class FileReceiveSession: Sendable {
             return .invalid("Invalid protocol magic: expected SHRK, got \(magic.map { String(format: "%02X", $0) }.joined())")
         }
 
-        // Validate version
+        // Read and validate version — only v2 is supported
         let version = buffer[buffer.startIndex + 4]
+        _protocolVersion = version
+
         guard version == SharilkaProtocol.version else {
-            return .invalid("Unsupported protocol version: \(version), expected \(SharilkaProtocol.version)")
+            return .invalid("Unsupported protocol version: \(version), only v\(SharilkaProtocol.version) is supported")
         }
 
-        // Read filename length as little-endian UInt64 (bytes 5..12)
-        let filenameLength = Self.readLittleEndianUInt64(from: buffer, at: 5)
+        guard buffer.count >= fixedSize else {
+            return .needMoreData
+        }
+
+        // Read flags byte (byte 5)
+        let flagsByte = buffer[buffer.startIndex + 5]
+        _transferFlags = TransferFlags(rawValue: flagsByte)
+
+        // Read filename length as little-endian UInt64 (bytes 6..13)
+        let filenameLength = Self.readLittleEndianUInt64(from: buffer, at: 6)
         _filenameLength = filenameLength
 
         // Sanity check filename length
@@ -262,24 +282,29 @@ final class FileReceiveSession: Sendable {
             return .invalid("Invalid filename length: \(filenameLength)")
         }
 
-        // Read file size as little-endian UInt64 (bytes 13..20)
-        let fileSize = Self.readLittleEndianUInt64(from: buffer, at: 13)
+        // Read file size as little-endian UInt64 (bytes 14..21)
+        let fileSize = Self.readLittleEndianUInt64(from: buffer, at: 14)
         _expectedSize = fileSize
 
         // Check if we have the full filename
-        let totalHeaderSize = SharilkaProtocol.headerFixedSize + Int(filenameLength)
+        let totalHeaderSize = fixedSize + Int(filenameLength)
         guard buffer.count >= totalHeaderSize else {
             return .needMoreData
         }
 
         // Read filename (UTF-8)
-        let filenameStart = buffer.startIndex + 21
+        let filenameStart = buffer.startIndex + fixedSize
         let filenameEnd = filenameStart + Int(filenameLength)
         let filenameData = buffer[filenameStart..<filenameEnd]
         guard let filename = String(data: filenameData, encoding: .utf8) else {
             return .invalid("Invalid UTF-8 filename")
         }
 
+        return finalizeHeader(filename: filename, fileSize: fileSize, totalHeaderSize: totalHeaderSize, buffer: buffer)
+    }
+
+    /// Finalizes the parsed v2 header: sanitizes the filename, prepares the destination file, and returns any overflow data.
+    private func finalizeHeader(filename: String, fileSize: UInt64, totalHeaderSize: Int, buffer: Data) -> HeaderParseResult {
         // Sanitize filename: remove path components to prevent directory traversal
         let sanitizedName = (filename as NSString).lastPathComponent
         guard !sanitizedName.isEmpty else {
@@ -289,8 +314,11 @@ final class FileReceiveSession: Sendable {
         _fileName = sanitizedName
         _headerParsed = true
 
+        let flags = _transferFlags
+        let flagsDesc = flags.isBenchmark ? " [benchmark]" : ""
+
         // Notify about the parsed header (triggers state change to .receiving)
-        onHeaderParsed(sanitizedName, fileSize)
+        onHeaderParsed(sanitizedName, fileSize, flags.isBenchmark)
 
         // Prepare the destination file
         let path = (saveDirectory as NSString).appendingPathComponent(sanitizedName)
@@ -308,7 +336,7 @@ final class FileReceiveSession: Sendable {
         }
         _fileHandle = handle
 
-        onLog("Transfer started: \"\(sanitizedName)\" (\(ByteCountFormatter.string(fromByteCount: Int64(fileSize), countStyle: .file)))", false)
+        onLog("Transfer started (v2\(flagsDesc)): \"\(sanitizedName)\" (\(ByteCountFormatter.string(fromByteCount: Int64(fileSize), countStyle: .file)))", false)
 
         // Return any overflow data (bytes beyond the header that are file content)
         let overflowStart = buffer.startIndex + totalHeaderSize
@@ -486,6 +514,8 @@ final class FileReceiveSession: Sendable {
         }
         guard !wasAlreadyCancelled else { return }
 
+        let flags = lock.withLock { _transferFlags }
+
         if success {
             // Close file handle — all data is safely on disk
             lock.withLock {
@@ -493,10 +523,24 @@ final class FileReceiveSession: Sendable {
                 _fileHandle = nil
             }
 
-            let (name, expected, start) = lock.withLock {
-                (_fileName, _expectedSize, _startTime)
+            let (name, expected, start, path) = lock.withLock {
+                (_fileName, _expectedSize, _startTime, _filePath)
             }
             let duration = Date().timeIntervalSince(start)
+
+            // Auto-delete benchmark files after successful transfer
+            if flags.isBenchmark, let benchmarkPath = path {
+                let fm = FileManager.default
+                if fm.fileExists(atPath: benchmarkPath) {
+                    do {
+                        try fm.removeItem(atPath: benchmarkPath)
+                        onLog("Benchmark file auto-deleted: \(benchmarkPath)", false)
+                    } catch {
+                        onLog("Failed to auto-delete benchmark file: \(error.localizedDescription)", true)
+                    }
+                }
+            }
+
             onLog("Transfer completed: \"\(name)\" in \(String(format: "%.1f", duration))s", false)
             connection.cancel()
 
@@ -506,7 +550,8 @@ final class FileReceiveSession: Sendable {
                 receivedBytes: bytesWritten,
                 duration: duration,
                 success: true,
-                error: nil
+                error: nil,
+                wasBenchmark: flags.isBenchmark
             ))
         } else {
             let reason = error ?? "Unknown error"
@@ -529,7 +574,8 @@ final class FileReceiveSession: Sendable {
                 receivedBytes: received,
                 duration: Date().timeIntervalSince(start),
                 success: false,
-                error: reason
+                error: reason,
+                wasBenchmark: flags.isBenchmark
             ))
         }
     }
@@ -558,8 +604,8 @@ final class FileReceiveSession: Sendable {
         connection.cancel()
         cleanupPartialFile()
 
-        let (name, expected, received, start) = lock.withLock {
-            (_fileName, _expectedSize, _receivedBytes, _startTime)
+        let (name, expected, received, start, flags) = lock.withLock {
+            (_fileName, _expectedSize, _receivedBytes, _startTime, _transferFlags)
         }
 
         onComplete(SessionResult(
@@ -568,7 +614,8 @@ final class FileReceiveSession: Sendable {
             receivedBytes: received,
             duration: Date().timeIntervalSince(start),
             success: false,
-            error: reason
+            error: reason,
+            wasBenchmark: flags.isBenchmark
         ))
     }
 

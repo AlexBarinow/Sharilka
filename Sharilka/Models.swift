@@ -18,6 +18,17 @@ enum ServerState: String, Sendable {
     case error = "Error"
 }
 
+// MARK: - Transfer Flags
+
+struct TransferFlags: Sendable, Equatable {
+    let rawValue: UInt8
+
+    static let none = TransferFlags(rawValue: 0)
+    static let benchmark = TransferFlags(rawValue: 1 << 0)
+
+    var isBenchmark: Bool { rawValue & TransferFlags.benchmark.rawValue != 0 }
+}
+
 // MARK: - Transfer Progress
 
 struct TransferProgress: Sendable {
@@ -28,6 +39,7 @@ struct TransferProgress: Sendable {
     var lastSpeedUpdateTime: Date = .now
     var lastSpeedBytes: UInt64 = 0
     var smoothedSpeed: Double = 0 // bytes per second
+    var isBenchmark: Bool = false
 
     var progressFraction: Double {
         guard expectedSize > 0 else { return 0 }
@@ -68,6 +80,7 @@ struct CompletedTransfer: Sendable {
     var fileName: String
     var fileSize: UInt64
     var duration: TimeInterval
+    var wasBenchmark: Bool = false
 
     var formattedSize: String {
         ByteCountFormatter.string(fromByteCount: Int64(fileSize), countStyle: .file)
@@ -120,10 +133,16 @@ struct LogEntry: Identifiable, Sendable {
 
 enum SharilkaProtocol {
     static let magic: [UInt8] = [0x53, 0x48, 0x52, 0x4B] // "SHRK"
-    static let version: UInt8 = 1
-    static let headerFixedSize = 4 + 1 + 8 + 8 // magic + version + filenameLen + fileSize = 21 bytes
+    static let version: UInt8 = 2
+
+    /// Fixed header: 4 (magic) + 1 (version) + 1 (flags) + 8 (filenameLen) + 8 (fileSize) = 22 bytes
+    static let headerFixedSize = 4 + 1 + 1 + 8 + 8 // 22 bytes
+
     static let defaultPort: UInt16 = 5001
-    static let saveDirectory = "/Users/alex/Exchange_Server_Data"
+    static let defaultSaveDirectory = "/Users/alex/Exchange_Server_Data"
     static let bonjourServiceType = "_sharilka._tcp"
     static let receiveChunkSize = 1_048_576 // 1 MB
+
+    /// UserDefaults key for persisted save folder path.
+    static let saveDirectoryKey = "SharilkaSaveDirectory"
 }

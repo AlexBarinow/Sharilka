@@ -6,6 +6,7 @@
 //  All published properties update on the main actor.
 //
 
+import AppKit
 import Foundation
 import Observation
 
@@ -16,7 +17,7 @@ final class ServerViewModel: FileReceiverServerDelegate {
 
     var serverState: ServerState = .stopped
     var currentPort: UInt16 = SharilkaProtocol.defaultPort
-    var saveDirectory: String = SharilkaProtocol.saveDirectory
+    var saveDirectory: String
 
     // Bonjour info
     var bonjourServiceType: String = SharilkaProtocol.bonjourServiceType
@@ -38,6 +39,18 @@ final class ServerViewModel: FileReceiverServerDelegate {
 
     private var server: FileReceiverServer?
     private var speedTimer: Timer?
+
+    // MARK: - Init
+
+    init() {
+        // Load persisted save directory or use default
+        if let persisted = UserDefaults.standard.string(forKey: SharilkaProtocol.saveDirectoryKey),
+           !persisted.isEmpty {
+            self.saveDirectory = persisted
+        } else {
+            self.saveDirectory = SharilkaProtocol.defaultSaveDirectory
+        }
+    }
 
     // MARK: - Computed Properties
 
@@ -101,6 +114,41 @@ final class ServerViewModel: FileReceiverServerDelegate {
         }
     }
 
+    /// Opens an NSOpenPanel for directory selection and persists the result.
+    func chooseSaveFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Select the folder where received files will be saved"
+
+        if panel.runModal() == .OK, let url = panel.url {
+            let newPath = url.path
+            saveDirectory = newPath
+            UserDefaults.standard.set(newPath, forKey: SharilkaProtocol.saveDirectoryKey)
+            addLog("Save folder changed to: \(newPath)", isError: false)
+
+            // If server is running, restart it with the new save directory
+            if server != nil {
+                stopServer()
+                startServer()
+                addLog("Server restarted with new save folder", isError: false)
+            }
+        }
+    }
+
+    /// Reveals the current save folder in Finder.
+    func revealInFinder() {
+        let url = URL(fileURLWithPath: saveDirectory, isDirectory: true)
+        // Ensure directory exists before trying to reveal it
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: saveDirectory) {
+            try? fm.createDirectory(atPath: saveDirectory, withIntermediateDirectories: true)
+        }
+        NSWorkspace.shared.open(url)
+    }
+
     // MARK: - FileReceiverServerDelegate
 
     nonisolated func serverDidChangeState(_ state: ServerState) {
@@ -122,7 +170,7 @@ final class ServerViewModel: FileReceiverServerDelegate {
         }
     }
 
-    nonisolated func serverDidStartTransfer(fileName: String, fileSize: UInt64) {
+    nonisolated func serverDidStartTransfer(fileName: String, fileSize: UInt64, isBenchmark: Bool) {
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.transferProgress = TransferProgress(
@@ -132,7 +180,8 @@ final class ServerViewModel: FileReceiverServerDelegate {
                 startTime: .now,
                 lastSpeedUpdateTime: .now,
                 lastSpeedBytes: 0,
-                smoothedSpeed: 0
+                smoothedSpeed: 0,
+                isBenchmark: isBenchmark
             )
             self.serverState = .receiving
             self.startSpeedTimer()
@@ -151,12 +200,14 @@ final class ServerViewModel: FileReceiverServerDelegate {
             self.stopSpeedTimer()
 
             if result.success {
+                let benchmarkLabel = result.wasBenchmark ? " [benchmark — file auto-deleted]" : ""
                 self.lastCompletedTransfer = CompletedTransfer(
                     fileName: result.fileName,
                     fileSize: result.fileSize,
-                    duration: result.duration
+                    duration: result.duration,
+                    wasBenchmark: result.wasBenchmark
                 )
-                self.addLog("✅ Transfer completed: \"\(result.fileName)\" — \(ByteCountFormatter.string(fromByteCount: Int64(result.fileSize), countStyle: .file)) in \(String(format: "%.1f", result.duration))s (\(String(format: "%.1f", Double(result.fileSize) / result.duration / 1_048_576)) MB/s)", isError: false)
+                self.addLog("✅ Transfer completed\(benchmarkLabel): \"\(result.fileName)\" — \(ByteCountFormatter.string(fromByteCount: Int64(result.fileSize), countStyle: .file)) in \(String(format: "%.1f", result.duration))s (\(String(format: "%.1f", Double(result.fileSize) / result.duration / 1_048_576)) MB/s)", isError: false)
             } else {
                 self.addLog("❌ Transfer failed: \(result.error ?? "unknown")", isError: true)
                 if !result.fileName.isEmpty {

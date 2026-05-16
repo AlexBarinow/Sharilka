@@ -87,8 +87,40 @@ struct ContentView: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
                 infoRow("TCP Port", value: "\(viewModel.currentPort)")
-                infoRow("Save Directory", value: viewModel.saveDirectory)
-                    .help(viewModel.saveDirectory)
+
+                // Save directory with folder controls
+                HStack(alignment: .top) {
+                    Text("Save Directory")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 140, alignment: .trailing)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(viewModel.saveDirectory)
+                            .font(.system(.subheadline, design: .monospaced))
+                            .textSelection(.enabled)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+
+                        HStack(spacing: 8) {
+                            Button {
+                                viewModel.chooseSaveFolder()
+                            } label: {
+                                Label("Choose Save Folder", systemImage: "folder.badge.gearshape")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+
+                            Button {
+                                viewModel.revealInFinder()
+                            } label: {
+                                Label("Reveal in Finder", systemImage: "arrow.right.circle")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
+                }
 
                 if !viewModel.localAddresses.isEmpty {
                     Divider()
@@ -121,7 +153,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 8) {
                 infoRow("Service Type", value: viewModel.bonjourServiceType)
                 infoRow("Service Name", value: viewModel.bonjourServiceName.isEmpty ? "(not advertised)" : viewModel.bonjourServiceName)
-                infoRow("Protocol Version", value: "\(SharilkaProtocol.version)")
+                infoRow("Protocol", value: "v2")
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } label: {
@@ -138,12 +170,20 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     if !viewModel.transferProgress.fileName.isEmpty {
                         HStack {
-                            Image(systemName: "doc.fill")
-                                .foregroundStyle(.blue)
+                            Image(systemName: viewModel.transferProgress.isBenchmark ? "gauge.with.dots.needle.67percent" : "doc.fill")
+                                .foregroundStyle(viewModel.transferProgress.isBenchmark ? .orange : .blue)
                             Text(viewModel.transferProgress.fileName)
                                 .font(.headline)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
+                            if viewModel.transferProgress.isBenchmark {
+                                Text("BENCHMARK")
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Capsule().fill(.orange))
+                            }
                         }
                     }
 
@@ -202,6 +242,19 @@ struct ContentView: View {
                     infoRow("Size", value: last.formattedSize)
                     infoRow("Duration", value: last.formattedDuration)
                     infoRow("Average Speed", value: String(format: "%.1f MB/s", last.averageSpeedMBps))
+                    if last.wasBenchmark {
+                        HStack {
+                            Text("")
+                                .frame(width: 140)
+                            HStack(spacing: 4) {
+                                Image(systemName: "gauge.with.dots.needle.67percent")
+                                    .foregroundStyle(.orange)
+                                Text("Benchmark — file auto-deleted")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             } label: {
